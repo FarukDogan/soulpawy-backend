@@ -109,6 +109,8 @@ async function fetchBlogRecommendations(blogTags) {
   const store = process.env.SHOPIFY_STORE;
   if (!store) throw new Error("SHOPIFY_STORE is not set");
 
+  const publicDomain = process.env.PUBLIC_STORE_DOMAIN || store;
+
   const token = await getShopifyAccessToken();
   const blogs = await getBlogs();
 
@@ -136,11 +138,12 @@ async function fetchBlogRecommendations(blogTags) {
     .slice(0, 3)
     .map((a) => ({
       title: a.title,
-      url: `https://${store.replace(".myshopify.com", ".com")}/blogs/${learnBlog.handle}/${a.handle}`
+      url: `https://${publicDomain}/blogs/${learnBlog.handle}/${a.handle}`
     }));
 
   return articles;
 }
+
 
 const app = express();
 app.use(cors());
