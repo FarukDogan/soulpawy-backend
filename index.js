@@ -45,6 +45,8 @@ Return ONLY valid JSON matching this schema:
   "blog_tags": ["need_anxiety","need_separation","need_sleep","core_topic"],
   "product_tags": ["need_anxiety","need_separation","type_heartbeat","species_dog"],
   "short_summary": ""
+  /products-by-tags
+
 }
 
 Rules:
