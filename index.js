@@ -3,6 +3,48 @@ import cors from "cors";
 import dotenv from "dotenv";
 import OpenAI from "openai";
 import axios from "axios";
+let shopifyTokenCache = {
+  token: null,
+  expiresAt: 0
+};
+
+async function getShopifyAccessToken() {
+  const store = process.env.SHOPIFY_STORE;
+  const clientId = process.env.SHOPIFY_CLIENT_ID;
+  const clientSecret = process.env.SHOPIFY_CLIENT_SECRET;
+
+  if (!store || !clientId || !clientSecret) {
+    throw new Error("Missing SHOPIFY_STORE / SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET env vars");
+  }
+
+  // Cache: token 24 saat; biz güvenli olsun diye 5 dk erken yenileriz
+  const now = Date.now();
+  if (shopifyTokenCache.token && now < shopifyTokenCache.expiresAt - 5 * 60 * 1000) {
+    return shopifyTokenCache.token;
+  }
+
+  const url = `https://${store}/admin/oauth/access_token`;
+
+  const body = new URLSearchParams();
+  body.set("grant_type", "client_credentials");
+  body.set("client_id", clientId);
+  body.set("client_secret", clientSecret);
+
+  const resp = await axios.post(url, body.toString(), {
+    headers: { "Content-Type": "application/x-www-form-urlencoded" }
+  });
+
+  const token = resp.data?.access_token;
+  const expiresIn = resp.data?.expires_in || 86399;
+
+  if (!token) throw new Error("No access_token returned from Shopify");
+
+  shopifyTokenCache.token = token;
+  shopifyTokenCache.expiresAt = now + expiresIn * 1000;
+
+  return token;
+}
+
 
 dotenv.config();
 
