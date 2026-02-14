@@ -3,6 +3,13 @@ import cors from "cors";
 import dotenv from "dotenv";
 import OpenAI from "openai";
 import axios from "axios";
+
+dotenv.config();
+
+/**
+ * Shopify Client Credentials (server-to-server) access token cache
+ * Token expires ~24h. We refresh 5 minutes early.
+ */
 let shopifyTokenCache = {
   token: null,
   expiresAt: 0
@@ -14,10 +21,11 @@ async function getShopifyAccessToken() {
   const clientSecret = process.env.SHOPIFY_CLIENT_SECRET;
 
   if (!store || !clientId || !clientSecret) {
-    throw new Error("Missing SHOPIFY_STORE / SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET env vars");
+    throw new Error(
+      "Missing Shopify env. Required: SHOPIFY_STORE, SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET"
+    );
   }
 
-  // Cache: token 24 saat; biz güvenli olsun diye 5 dk erken yenileriz
   const now = Date.now();
   if (shopifyTokenCache.token && now < shopifyTokenCache.expiresAt - 5 * 60 * 1000) {
     return shopifyTokenCache.token;
@@ -45,12 +53,11 @@ async function getShopifyAccessToken() {
   return token;
 }
 
-
-dotenv.config();
-
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// Simple request log
 app.use((req, res, next) => {
   console.log(`[REQ] ${req.method} ${req.path}`);
   next();
@@ -63,6 +70,11 @@ const openai = new OpenAI({
 app.get("/health", (req, res) => {
   res.send("OK");
 });
+
+/**
+ * GET /products-by-tags?tags=need_anxiety,species_dog,type_heartbeat
+ * Returns up to 12 active, published products that contain ALL tags.
+ */
 app.get("/products-by-tags", async (req, res) => {
   try {
     const tags = (req.query.tags || "")
@@ -73,16 +85,17 @@ app.get("/products-by-tags", async (req, res) => {
     if (tags.length === 0) return res.json({ products: [] });
 
     const store = process.env.SHOPIFY_STORE;
-    const token = process.env.SHOPIFY_TOKEN;
-
-    if (!store || !token) {
+    if (!store) {
       return res.status(500).json({
         error: "Missing Shopify env",
-        detail: "SHOPIFY_STORE or SHOPIFY_TOKEN is not set"
+        detail: "SHOPIFY_STORE is not set"
       });
     }
 
-    const url = `https://${store}/admin/api/2025-01/products.json?limit=50&fields=id,title,handle,tags,images,variants,status,published_at`;
+    const token = await getShopifyAccessToken();
+
+    // Use a stable Admin API version
+    const url = `https://${store}/admin/api/2024-10/products.json?limit=50&fields=id,title,handle,tags,images,variants,status,published_at`;
 
     const resp = await axios.get(url, {
       headers: { "X-Shopify-Access-Token": token }
@@ -108,21 +121,30 @@ app.get("/products-by-tags", async (req, res) => {
     res.json({ products });
   } catch (err) {
     console.error("SHOPIFY ERROR:", err?.response?.status, err?.message, err?.response?.data);
-    res.status(500).json({ error: "Shopify error", detail: err?.message || String(err) });
+    res.status(500).json({
+      error: "Shopify error",
+      detail: err?.response?.data || err?.message || String(err)
+    });
   }
 });
 
-
+/**
+ * POST /analyze
+ * Body: { "message": "..." }
+ * Returns: { result: "<JSON string>" }
+ */
 app.post("/analyze", async (req, res) => {
   try {
     const { message } = req.body;
+    if (!message || typeof message !== "string") {
+      return res.status(400).json({ error: "Bad request", detail: "message is required" });
+    }
 
     const completion = await openai.chat.completions.create({
       model: "gpt-4.1-mini",
       messages: [
         {
           role: "system",
-          
           content: `
 You are Soulpawy's pet behavior triage assistant.
 Return ONLY valid JSON matching this schema:
@@ -136,8 +158,6 @@ Return ONLY valid JSON matching this schema:
   "blog_tags": ["need_anxiety","need_separation","need_sleep","core_topic"],
   "product_tags": ["need_anxiety","need_separation","type_heartbeat","species_dog"],
   "short_summary": ""
-  /products-by-tags
-
 }
 
 Rules:
@@ -147,27 +167,19 @@ Rules:
 - product_tags must include species_dog or species_cat.
 - No extra text, no markdown, JSON only.
 `
-
         },
-        {
-          role: "user",
-          content: message
-        }
+        { role: "user", content: message }
       ]
     });
 
-    res.json({
-      result: completion.choices[0].message.content
-    });
-
+    res.json({ result: completion.choices[0].message.content });
   } catch (err) {
-  console.error("AI ERROR:", err?.status, err?.message, err?.response?.data);
-  res.status(500).json({
-    error: "AI error",
-    detail: err?.message || String(err)
-  });
-}
-
+    console.error("AI ERROR:", err?.status, err?.message, err?.response?.data);
+    res.status(500).json({
+      error: "AI error",
+      detail: err?.message || String(err)
+    });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
