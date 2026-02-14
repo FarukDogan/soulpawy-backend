@@ -9,6 +9,10 @@ dotenv.config();
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use((req, res, next) => {
+  console.log(`[REQ] ${req.method} ${req.path}`);
+  next();
+});
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY
@@ -41,8 +45,13 @@ app.post("/analyze", async (req, res) => {
     });
 
   } catch (err) {
-    res.status(500).json({ error: "AI error" });
-  }
+  console.error("AI ERROR:", err?.status, err?.message, err?.response?.data);
+  res.status(500).json({
+    error: "AI error",
+    detail: err?.message || String(err)
+  });
+}
+
 });
 
 const PORT = process.env.PORT || 3000;
