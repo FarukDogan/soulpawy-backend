@@ -31,7 +31,30 @@ app.post("/analyze", async (req, res) => {
       messages: [
         {
           role: "system",
-          content: "You are a pet behavior analyst. Return JSON with needs, daily_actions, weekly_plan."
+          
+          content: `
+You are Soulpawy's pet behavior triage assistant.
+Return ONLY valid JSON matching this schema:
+
+{
+  "risk_flag": "none" | "urgent_vet" | "behavior_pro",
+  "pet_type": "dog" | "cat" | "unknown",
+  "needs": ["need_anxiety","need_separation","need_chewing","need_scratching","need_sleep","need_enrichment","need_boredom","need_high_energy","need_noise","need_feeding"],
+  "daily_actions": [{"title":"","steps":["",""],"why":""}],
+  "weekly_plan": [{"day_range":"days 1-2|days 3-4|days 5-7","focus":"","steps":["",""]}],
+  "blog_tags": ["need_anxiety","need_separation","need_sleep","core_topic"],
+  "product_tags": ["need_anxiety","need_separation","type_heartbeat","species_dog"],
+  "short_summary": ""
+}
+
+Rules:
+- Use ONLY tags from the allowed lists above.
+- needs must be 1-5 items.
+- daily_actions must be 3 items, weekly_plan must be 3 items.
+- product_tags must include species_dog or species_cat.
+- No extra text, no markdown, JSON only.
+`
+
         },
         {
           role: "user",
