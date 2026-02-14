@@ -71,15 +71,20 @@ async function fetchProductsByTags(tags) {
       return tags.every((t) => ptags.includes(t));
     })
     .slice(0, 12)
-    .map((p) => ({
-      id: p.id,
-      title: p.title,
-      handle: p.handle,
-      tags: p.tags,
-      image: p.images?.[0]?.src || null,
-      variant_id: p.variants?.[0]?.id || null,
-      price: p.variants?.[0]?.price || null
-    }));
+.map((p) => {
+  const publicDomain = process.env.PUBLIC_STORE_DOMAIN || process.env.SHOPIFY_STORE;
+  return {
+    id: p.id,
+    title: p.title,
+    handle: p.handle,
+    url: `https://${publicDomain}/products/${p.handle}`,
+    tags: p.tags,
+    image: p.images?.[0]?.src || null,
+    variant_id: p.variants?.[0]?.id || null,
+    price: p.variants?.[0]?.price || null
+  };
+});
+
 
   return products;
 }
