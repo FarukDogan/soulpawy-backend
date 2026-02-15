@@ -144,10 +144,7 @@ async function fetchProductsByTags(requestedTags) {
     .map(({ _score, ...rest }) => rest);
 }
 
-// --- BLOG/ARTICLE FETCH + MATCHING (ROBUST) ---
-// We avoid relying on /articles.json directly.
-// We fetch blogs, then fetch /blogs/{id}/articles.json for each blog.
-// Cached to keep Shopify calls low.
+// --- BLOG/ARTICLE FETCH + MATCHING (ROBUST: blog-bazlı) ---
 let blogCache = { blogs: null, expiresAt: 0 };
 let articleCache = { items: null, expiresAt: 0 };
 
@@ -188,7 +185,6 @@ async function getAllArticlesCached() {
 
   const all = [];
   for (const b of blogs) {
-    // NOTE: limit=250 per blog. If any blog has >250, we can add pagination later.
     const url = `https://${store}/admin/api/2025-01/blogs/${b.id}/articles.json?limit=250&fields=id,title,handle,tags,summary_html,image,published_at`;
     const resp = await axios.get(url, { headers: { "X-Shopify-Access-Token": token } });
 
@@ -232,9 +228,7 @@ async function fetchArticlesByTags(product_tags) {
     .map(a => {
       let score = 0;
 
-      // Optional (only if your articles also have species tags)
       if (speciesTag && a.tags.includes(speciesTag)) score += 1;
-
       for (const t of typeTags) if (a.tags.includes(t)) score += 4;
       for (const n of needTags) if (a.tags.includes(n)) score += 2;
 
@@ -343,15 +337,6 @@ final_message MUST include:
 3) a natural sales push: suggest adding the recommended items to cart today,
 4) discount offered as personal initiative (no "random"),
 5) mention: after purchase, we will email a copy of the plan + a summary of this chat as a thank-you.
-
-Allowed NEED tags:
-need_anxiety, need_separation, need_chewing, need_scratching, need_sleep, need_enrichment, need_boredom, need_high_energy, need_noise, need_feeding
-
-Allowed TYPE tags:
-type_heartbeat, type_chew, type_puzzle, type_calming_wrap, type_scratch_post, type_feeder, type_noise_mask
-
-Species tags (must include one):
-species_dog, species_cat
 `.trim();
 
 app.get("/health", (req, res) => res.send("OK"));
@@ -400,6 +385,11 @@ app.post("/chat", async (req, res) => {
       const products = await fetchProductsByTags(product_tags);
       const articles = await fetchArticlesByTags(product_tags);
 
+      // HARD DEFAULTS (fixes missing question / missing bool)
+      const askQ = String(parsed.ask_articles_question || "").trim() ||
+        "Would you like to see a few related articles from our Learn blog? (Reply: yes / no)";
+      const articlesAvail = true; // force true; frontend decides based on list
+
       const analysis = {
         pet_type: parsed.pet_type,
         pet_name: parsed.pet_name,
@@ -410,8 +400,8 @@ app.post("/chat", async (req, res) => {
         product_tags,
         daily_actions: parsed.daily_actions,
         weekly_plan: parsed.weekly_plan,
-        ask_articles_question: parsed.ask_articles_question,
-        articles_available: !!parsed.articles_available
+        ask_articles_question: askQ,
+        articles_available: articlesAvail
       };
 
       return res.json({
