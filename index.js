@@ -1,5 +1,3 @@
-// index.js (Render backend) — FULL FILE (CTRL+A -> DELETE -> PASTE)
-
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -19,13 +17,6 @@ app.use((req, res, next) => {
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-/**
- * Shopify: client credentials token cache
- * Requires:
- *  - SHOPIFY_STORE (example: tuxi7x-y5.myshopify.com)
- *  - SHOPIFY_CLIENT_ID
- *  - SHOPIFY_CLIENT_SECRET
- */
 let shopifyTokenCache = { token: null, expiresAt: 0 };
 
 async function getShopifyAccessToken() {
@@ -64,15 +55,11 @@ async function getShopifyAccessToken() {
 }
 
 function safeJsonParse(str) {
-  try {
-    return JSON.parse(str);
-  } catch {
-    return null;
-  }
+  try { return JSON.parse(str); } catch { return null; }
 }
 
 // ------------------------
-// TAG WHITELISTS (CRITICAL)
+// TAG WHITELISTS
 // ------------------------
 const ALLOWED_SPECIES = new Set(["species_dog", "species_cat"]);
 const ALLOWED_TYPE = new Set([
@@ -97,20 +84,16 @@ const ALLOWED_NEED = new Set([
   "need_feeding"
 ]);
 
-function uniq(arr) {
-  return [...new Set(arr)];
-}
+function uniq(arr) { return [...new Set(arr)]; }
 
 function normalizeProductTags(rawTags, pet_type) {
   const tags = Array.isArray(rawTags) ? rawTags.map(String) : [];
   const cleaned = tags.map(t => t.trim()).filter(Boolean);
 
-  // keep only whitelisted tags
   let species = cleaned.filter(t => ALLOWED_SPECIES.has(t));
   let types = cleaned.filter(t => ALLOWED_TYPE.has(t));
   let needs = cleaned.filter(t => ALLOWED_NEED.has(t));
 
-  // enforce exactly 1 species
   if (species.length === 0) {
     const t = String(pet_type || "").toLowerCase();
     species = [t === "cat" ? "species_cat" : "species_dog"];
@@ -118,56 +101,42 @@ function normalizeProductTags(rawTags, pet_type) {
     species = [species[0]];
   }
 
-  // enforce at least 1 type
   if (types.length === 0) {
-    // safe default that likely exists in store; adjust later if you prefer
     types = ["type_calming_wrap"];
   } else {
     types = [types[0]];
   }
 
-  // enforce 1-4 needs (prefer 2)
   if (needs.length === 0) {
     needs = ["need_anxiety"];
   } else {
     needs = needs.slice(0, 4);
   }
 
-  // final size clamp: 2-6 total
-  const result = uniq([...species, ...types, ...needs]).slice(0, 6);
-  return result;
+  return uniq([...species, ...types, ...needs]).slice(0, 6);
 }
 
 /**
- * Product matching: "mostly matches" (scored), not 100% tag match
- * Key rules:
- * - Tagless products are excluded.
- * - Species must match (if provided).
- * - Must match at least 1 non-species tag (type_/need_) to be eligible.
+ * Product matching (scored)
  */
 async function fetchProductsByTags(requestedTags) {
   const store = process.env.SHOPIFY_STORE;
   if (!store) throw new Error("Missing SHOPIFY_STORE env var");
 
   const token = await getShopifyAccessToken();
-
   const url = `https://${store}/admin/api/2025-01/products.json?limit=250&fields=id,title,handle,tags,images,variants,status,published_at`;
   const resp = await axios.get(url, { headers: { "X-Shopify-Access-Token": token } });
 
   const tags = Array.isArray(requestedTags) ? requestedTags : [];
-  const speciesTag = tags.find((t) => t === "species_dog" || t === "species_cat") || null;
-  const typeTags = tags.filter((t) => t.startsWith("type_"));
-  const needTags = tags.filter((t) => t.startsWith("need_"));
+  const speciesTag = tags.find(t => t === "species_dog" || t === "species_cat") || null;
+  const typeTags = tags.filter(t => t.startsWith("type_"));
+  const needTags = tags.filter(t => t.startsWith("need_"));
 
   const products = (resp.data.products || [])
-    .filter((p) => p.status === "active" && p.published_at)
-    .map((p) => {
-      const ptags = (p.tags || "")
-        .split(",")
-        .map((x) => x.trim())
-        .filter(Boolean);
-
-      if (ptags.length === 0) return null;
+    .filter(p => p.status === "active" && p.published_at)
+    .map(p => {
+      const ptags = (p.tags || "").split(",").map(x => x.trim()).filter(Boolean);
+      if (!ptags.length) return null;
       if (speciesTag && !ptags.includes(speciesTag)) return null;
 
       let score = 0;
@@ -176,19 +145,12 @@ async function fetchProductsByTags(requestedTags) {
       if (speciesTag) score += 3;
 
       for (const t of typeTags) {
-        if (ptags.includes(t)) {
-          score += 4;
-          matchedNonSpecies++;
-        }
+        if (ptags.includes(t)) { score += 4; matchedNonSpecies++; }
       }
       for (const n of needTags) {
-        if (ptags.includes(n)) {
-          score += 2;
-          matchedNonSpecies++;
-        }
+        if (ptags.includes(n)) { score += 2; matchedNonSpecies++; }
       }
 
-      // strict rule: must match beyond species
       if (speciesTag && matchedNonSpecies === 0) return null;
 
       return {
@@ -211,7 +173,6 @@ async function fetchProductsByTags(requestedTags) {
     .map(({ _score, ...rest }) => rest);
 }
 
-// fallback: if strict matching returns 0, show best species-matching tagged products
 async function fetchProductsFallbackBySpecies(speciesTag) {
   const store = process.env.SHOPIFY_STORE;
   if (!store) throw new Error("Missing SHOPIFY_STORE env var");
@@ -227,7 +188,6 @@ async function fetchProductsFallbackBySpecies(speciesTag) {
       if (!ptags.length) return null;
       if (speciesTag && !ptags.includes(speciesTag)) return null;
 
-      // score any meaningful tag presence
       let score = 0;
       for (const t of ptags) {
         if (t.startsWith("type_")) score += 2;
@@ -251,7 +211,7 @@ async function fetchProductsFallbackBySpecies(speciesTag) {
   return all.sort((a,b)=>b._score-a._score).slice(0, 8).map(({_score, ...r})=>r);
 }
 
-// --- BLOG/ARTICLE FETCH + MATCHING (blog-bazlı) ---
+// --- BLOG/ARTICLE ---
 let blogCache = { blogs: null, expiresAt: 0 };
 let articleCache = { items: null, expiresAt: 0 };
 
@@ -260,9 +220,8 @@ async function getBlogsCached() {
   if (blogCache.blogs && now < blogCache.expiresAt) return blogCache.blogs;
 
   const store = process.env.SHOPIFY_STORE;
-  if (!store) throw new Error("Missing SHOPIFY_STORE env var");
-
   const token = await getShopifyAccessToken();
+
   const url = `https://${store}/admin/api/2025-01/blogs.json?limit=250&fields=id,handle`;
   const resp = await axios.get(url, { headers: { "X-Shopify-Access-Token": token } });
 
@@ -285,8 +244,6 @@ async function getAllArticlesCached() {
   if (articleCache.items && now < articleCache.expiresAt) return articleCache.items;
 
   const store = process.env.SHOPIFY_STORE;
-  if (!store) throw new Error("Missing SHOPIFY_STORE env var");
-
   const token = await getShopifyAccessToken();
   const blogs = await getBlogsCached();
 
@@ -298,11 +255,7 @@ async function getAllArticlesCached() {
     const items = (resp.data.articles || [])
       .filter(a => !!a.published_at)
       .map(a => {
-        const tags = (a.tags || "")
-          .split(",")
-          .map(x => x.trim())
-          .filter(Boolean);
-
+        const tags = (a.tags || "").split(",").map(x => x.trim()).filter(Boolean);
         return {
           id: a.id,
           title: a.title,
@@ -347,7 +300,7 @@ async function fetchArticlesByTags(product_tags) {
     .map(({ _score, ...rest }) => rest);
 }
 
-// Discount tiers (create these in Shopify Discounts)
+// Discount tiers
 const DISCOUNT_CODES = { 10: "SOULPAWY10", 15: "SOULPAWY15", 20: "SOULPAWY20", 25: "SOULPAWY25" };
 function normalizeDiscountTier(x) {
   const n = Number(x);
@@ -372,6 +325,9 @@ Rules:
   tell them to contact an emergency vet immediately, then ask one minimal safety question.
 - When you have enough info to produce a full plan, end your message with EXACTLY:
   I’m ready to create your plan.
+
+Tone:
+- Warm, friend-like, supportive, concise.
 `.trim();
 
 const FINALIZE_SYSTEM = `
@@ -391,7 +347,7 @@ Return ONLY valid JSON with this schema (no markdown, no extra text):
   "daily_actions": [
     {
       "title": string,
-      "steps": [string, string, string],
+      "steps": [string, string, string, string],
       "why": string,
       "product_hooks": [{ "tag": string, "instruction": string }]
     }
@@ -401,7 +357,7 @@ Return ONLY valid JSON with this schema (no markdown, no extra text):
     {
       "day_range": "days 1-2" | "days 3-4" | "days 5-7",
       "focus": string,
-      "steps": [string, string],
+      "steps": [string, string, string],
       "product_hooks": [{ "tag": string, "instruction": string }]
     }
   ],
@@ -418,8 +374,21 @@ Hard requirements:
 - product_tags must be 2-6 items and only from allowed lists below.
 - discount_tier must be 10/15/20/25.
 
-Most important:
-- daily_actions and weekly_plan MUST include product_hooks that reference tags in product_tags.
+Quality requirements (IMPORTANT):
+- Make the plan feel real, caring, and specific.
+- daily_actions.steps MUST be 4 items (longer, more helpful).
+- weekly_plan.steps MUST be 3 items (more detailed).
+- product_hooks must reference tags in product_tags and include practical use instructions.
+
+final_message rules:
+- DO NOT include the discount code itself (frontend will show it).
+- Tone: warm, reassuring, genuinely concerned.
+- Must address the pet by name (if unknown, say "your pet").
+- Must mention we’re worried, want to help, and the next step is to add recommended items to cart today.
+- Must mention: after purchase, we will email a copy of the plan + a summary of this chat as a thank-you.
+
+Default ask_articles_question (friendly):
+"Would you like to see a few related articles from our Learn blog? (Reply: yes / no)"
 
 Allowed NEED tags:
 need_anxiety, need_separation, need_chewing, need_scratching, need_sleep, need_enrichment, need_boredom, need_high_energy, need_noise, need_feeding
@@ -468,7 +437,6 @@ app.post("/chat", async (req, res) => {
       const tier = normalizeDiscountTier(parsed.discount_tier);
       const discount_code = DISCOUNT_CODES[tier];
 
-      // CRITICAL: normalize product tags so product matching never breaks
       const product_tags = normalizeProductTags(parsed.product_tags, parsed.pet_type);
 
       let products = await fetchProductsByTags(product_tags);
