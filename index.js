@@ -71,13 +71,79 @@ function safeJsonParse(str) {
   }
 }
 
+// ------------------------
+// TAG WHITELISTS (CRITICAL)
+// ------------------------
+const ALLOWED_SPECIES = new Set(["species_dog", "species_cat"]);
+const ALLOWED_TYPE = new Set([
+  "type_heartbeat",
+  "type_chew",
+  "type_puzzle",
+  "type_calming_wrap",
+  "type_scratch_post",
+  "type_feeder",
+  "type_noise_mask"
+]);
+const ALLOWED_NEED = new Set([
+  "need_anxiety",
+  "need_separation",
+  "need_chewing",
+  "need_scratching",
+  "need_sleep",
+  "need_enrichment",
+  "need_boredom",
+  "need_high_energy",
+  "need_noise",
+  "need_feeding"
+]);
+
+function uniq(arr) {
+  return [...new Set(arr)];
+}
+
+function normalizeProductTags(rawTags, pet_type) {
+  const tags = Array.isArray(rawTags) ? rawTags.map(String) : [];
+  const cleaned = tags.map(t => t.trim()).filter(Boolean);
+
+  // keep only whitelisted tags
+  let species = cleaned.filter(t => ALLOWED_SPECIES.has(t));
+  let types = cleaned.filter(t => ALLOWED_TYPE.has(t));
+  let needs = cleaned.filter(t => ALLOWED_NEED.has(t));
+
+  // enforce exactly 1 species
+  if (species.length === 0) {
+    const t = String(pet_type || "").toLowerCase();
+    species = [t === "cat" ? "species_cat" : "species_dog"];
+  } else {
+    species = [species[0]];
+  }
+
+  // enforce at least 1 type
+  if (types.length === 0) {
+    // safe default that likely exists in store; adjust later if you prefer
+    types = ["type_calming_wrap"];
+  } else {
+    types = [types[0]];
+  }
+
+  // enforce 1-4 needs (prefer 2)
+  if (needs.length === 0) {
+    needs = ["need_anxiety"];
+  } else {
+    needs = needs.slice(0, 4);
+  }
+
+  // final size clamp: 2-6 total
+  const result = uniq([...species, ...types, ...needs]).slice(0, 6);
+  return result;
+}
+
 /**
  * Product matching: "mostly matches" (scored), not 100% tag match
- * Key rules for QUALITY:
+ * Key rules:
  * - Tagless products are excluded.
  * - Species must match (if provided).
  * - Must match at least 1 non-species tag (type_/need_) to be eligible.
- * - type_ tags weighted higher than need_ tags.
  */
 async function fetchProductsByTags(requestedTags) {
   const store = process.env.SHOPIFY_STORE;
@@ -122,6 +188,7 @@ async function fetchProductsByTags(requestedTags) {
         }
       }
 
+      // strict rule: must match beyond species
       if (speciesTag && matchedNonSpecies === 0) return null;
 
       return {
@@ -144,7 +211,47 @@ async function fetchProductsByTags(requestedTags) {
     .map(({ _score, ...rest }) => rest);
 }
 
-// --- BLOG/ARTICLE FETCH + MATCHING (ROBUST: blog-bazlı) ---
+// fallback: if strict matching returns 0, show best species-matching tagged products
+async function fetchProductsFallbackBySpecies(speciesTag) {
+  const store = process.env.SHOPIFY_STORE;
+  if (!store) throw new Error("Missing SHOPIFY_STORE env var");
+
+  const token = await getShopifyAccessToken();
+  const url = `https://${store}/admin/api/2025-01/products.json?limit=250&fields=id,title,handle,tags,images,variants,status,published_at`;
+  const resp = await axios.get(url, { headers: { "X-Shopify-Access-Token": token } });
+
+  const all = (resp.data.products || [])
+    .filter(p => p.status === "active" && p.published_at)
+    .map(p => {
+      const ptags = (p.tags || "").split(",").map(x => x.trim()).filter(Boolean);
+      if (!ptags.length) return null;
+      if (speciesTag && !ptags.includes(speciesTag)) return null;
+
+      // score any meaningful tag presence
+      let score = 0;
+      for (const t of ptags) {
+        if (t.startsWith("type_")) score += 2;
+        if (t.startsWith("need_")) score += 1;
+      }
+
+      return {
+        id: p.id,
+        title: p.title,
+        handle: p.handle,
+        tags: p.tags,
+        image: p.images?.[0]?.src || null,
+        variant_id: p.variants?.[0]?.id || null,
+        price: p.variants?.[0]?.price || null,
+        url: p.handle ? `/products/${p.handle}` : null,
+        _score: score
+      };
+    })
+    .filter(Boolean);
+
+  return all.sort((a,b)=>b._score-a._score).slice(0, 8).map(({_score, ...r})=>r);
+}
+
+// --- BLOG/ARTICLE FETCH + MATCHING (blog-bazlı) ---
 let blogCache = { blogs: null, expiresAt: 0 };
 let articleCache = { items: null, expiresAt: 0 };
 
@@ -161,7 +268,7 @@ async function getBlogsCached() {
 
   const blogs = (resp.data.blogs || []).map(b => ({ id: b.id, handle: b.handle }));
   blogCache.blogs = blogs;
-  blogCache.expiresAt = now + 15 * 60 * 1000; // 15 min
+  blogCache.expiresAt = now + 15 * 60 * 1000;
   return blogs;
 }
 
@@ -212,7 +319,7 @@ async function getAllArticlesCached() {
   }
 
   articleCache.items = all;
-  articleCache.expiresAt = now + 15 * 60 * 1000; // 15 min
+  articleCache.expiresAt = now + 15 * 60 * 1000;
   return all;
 }
 
@@ -227,11 +334,9 @@ async function fetchArticlesByTags(product_tags) {
   const scored = articles
     .map(a => {
       let score = 0;
-
       if (speciesTag && a.tags.includes(speciesTag)) score += 1;
       for (const t of typeTags) if (a.tags.includes(t)) score += 4;
       for (const n of needTags) if (a.tags.includes(n)) score += 2;
-
       return { ...a, _score: score };
     })
     .filter(a => a._score > 0);
@@ -243,13 +348,7 @@ async function fetchArticlesByTags(product_tags) {
 }
 
 // Discount tiers (create these in Shopify Discounts)
-const DISCOUNT_CODES = {
-  10: "SOULPAWY10",
-  15: "SOULPAWY15",
-  20: "SOULPAWY20",
-  25: "SOULPAWY25"
-};
-
+const DISCOUNT_CODES = { 10: "SOULPAWY10", 15: "SOULPAWY15", 20: "SOULPAWY20", 25: "SOULPAWY25" };
 function normalizeDiscountTier(x) {
   const n = Number(x);
   if ([10, 15, 20, 25].includes(n)) return n;
@@ -273,9 +372,6 @@ Rules:
   tell them to contact an emergency vet immediately, then ask one minimal safety question.
 - When you have enough info to produce a full plan, end your message with EXACTLY:
   I’m ready to create your plan.
-
-Tone:
-- Warm, friend-like, supportive, concise.
 `.trim();
 
 const FINALIZE_SYSTEM = `
@@ -297,9 +393,7 @@ Return ONLY valid JSON with this schema (no markdown, no extra text):
       "title": string,
       "steps": [string, string, string],
       "why": string,
-      "product_hooks": [
-        { "tag": string, "instruction": string }
-      ]
+      "product_hooks": [{ "tag": string, "instruction": string }]
     }
   ],
 
@@ -308,9 +402,7 @@ Return ONLY valid JSON with this schema (no markdown, no extra text):
       "day_range": "days 1-2" | "days 3-4" | "days 5-7",
       "focus": string,
       "steps": [string, string],
-      "product_hooks": [
-        { "tag": string, "instruction": string }
-      ]
+      "product_hooks": [{ "tag": string, "instruction": string }]
     }
   ],
 
@@ -328,15 +420,15 @@ Hard requirements:
 
 Most important:
 - daily_actions and weekly_plan MUST include product_hooks that reference tags in product_tags.
-- product_hooks must be practical usage instructions (when/how to use the product in the plan).
-- Do not “force” product hooks into every step; but overall the plan must clearly integrate products.
 
-final_message MUST include:
-1) the problem in plain words (mention pet_name),
-2) a confident but friendly transition into the plan,
-3) a natural sales push: suggest adding the recommended items to cart today,
-4) discount offered as personal initiative (no "random"),
-5) mention: after purchase, we will email a copy of the plan + a summary of this chat as a thank-you.
+Allowed NEED tags:
+need_anxiety, need_separation, need_chewing, need_scratching, need_sleep, need_enrichment, need_boredom, need_high_energy, need_noise, need_feeding
+
+Allowed TYPE tags:
+type_heartbeat, type_chew, type_puzzle, type_calming_wrap, type_scratch_post, type_feeder, type_noise_mask
+
+Species tags (must include one):
+species_dog, species_cat
 `.trim();
 
 app.get("/health", (req, res) => res.send("OK"));
@@ -376,19 +468,20 @@ app.post("/chat", async (req, res) => {
       const tier = normalizeDiscountTier(parsed.discount_tier);
       const discount_code = DISCOUNT_CODES[tier];
 
-      const product_tags = Array.isArray(parsed.product_tags) ? parsed.product_tags : [];
-      if (!product_tags.includes("species_dog") && !product_tags.includes("species_cat")) {
-        const t = String(parsed.pet_type || "").toLowerCase();
-        product_tags.push(t === "cat" ? "species_cat" : "species_dog");
+      // CRITICAL: normalize product tags so product matching never breaks
+      const product_tags = normalizeProductTags(parsed.product_tags, parsed.pet_type);
+
+      let products = await fetchProductsByTags(product_tags);
+      if (!products.length) {
+        const speciesTag = product_tags.find(t => ALLOWED_SPECIES.has(t)) || null;
+        products = await fetchProductsFallbackBySpecies(speciesTag);
       }
 
-      const products = await fetchProductsByTags(product_tags);
       const articles = await fetchArticlesByTags(product_tags);
 
-      // HARD DEFAULTS (fixes missing question / missing bool)
-      const askQ = String(parsed.ask_articles_question || "").trim() ||
+      const askQ =
+        String(parsed.ask_articles_question || "").trim() ||
         "Would you like to see a few related articles from our Learn blog? (Reply: yes / no)";
-      const articlesAvail = true; // force true; frontend decides based on list
 
       const analysis = {
         pet_type: parsed.pet_type,
@@ -401,7 +494,7 @@ app.post("/chat", async (req, res) => {
         daily_actions: parsed.daily_actions,
         weekly_plan: parsed.weekly_plan,
         ask_articles_question: askQ,
-        articles_available: articlesAvail
+        articles_available: true
       };
 
       return res.json({
