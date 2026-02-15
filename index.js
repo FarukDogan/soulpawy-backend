@@ -6,24 +6,29 @@ import axios from "axios";
 
 dotenv.config();
 
-/**
- * Shopify Client Credentials (server-to-server) access token cache
- * Token expires ~24h. We refresh 5 minutes early.
- */
-let shopifyTokenCache = {
-  token: null,
-  expiresAt: 0
-};
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// ---- LOG
+app.use((req, res, next) => {
+  console.log(`[REQ] ${req.method} ${req.path}`);
+  next();
+});
+
+// ---- OpenAI
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+// ---- Shopify: client credentials token cache
+let shopifyTokenCache = { token: null, expiresAt: 0 };
 
 async function getShopifyAccessToken() {
-  const store = process.env.SHOPIFY_STORE;
+  const store = process.env.SHOPIFY_STORE; // must be like: tuxi7x-y5.myshopify.com
   const clientId = process.env.SHOPIFY_CLIENT_ID;
   const clientSecret = process.env.SHOPIFY_CLIENT_SECRET;
 
   if (!store || !clientId || !clientSecret) {
-    throw new Error(
-      "Missing Shopify env. Required: SHOPIFY_STORE, SHOPIFY_CLIENT_ID, SHOPIFY_CLIENT_SECRET"
-    );
+    throw new Error("Missing SHOPIFY_STORE / SHOPIFY_CLIENT_ID / SHOPIFY_CLIENT_SECRET env vars");
   }
 
   const now = Date.now();
@@ -32,7 +37,6 @@ async function getShopifyAccessToken() {
   }
 
   const url = `https://${store}/admin/oauth/access_token`;
-
   const body = new URLSearchParams();
   body.set("grant_type", "client_credentials");
   body.set("client_id", clientId);
@@ -53,16 +57,37 @@ async function getShopifyAccessToken() {
   return token;
 }
 
+// ---- Discount tiers (pre-created in Shopify)
+const DISCOUNT_CODES = {
+  10: "SOULPAWY10",
+  15: "SOULPAWY15",
+  20: "SOULPAWY20",
+  25: "SOULPAWY25"
+};
+
+function normalizeDiscountTier(x) {
+  const n = Number(x);
+  if ([10, 15, 20, 25].includes(n)) return n;
+  return 10;
+}
+
+// ---- Helpers
+function safeJsonParse(str) {
+  try {
+    return JSON.parse(str);
+  } catch (e) {
+    return null;
+  }
+}
+
 async function fetchProductsByTags(tags) {
   const store = process.env.SHOPIFY_STORE;
-  if (!store) throw new Error("SHOPIFY_STORE is not set");
+  if (!store) throw new Error("Missing SHOPIFY_STORE env var");
 
   const token = await getShopifyAccessToken();
 
-  const url = `https://${store}/admin/api/2024-10/products.json?limit=50&fields=id,title,handle,tags,images,variants,status,published_at`;
-  const resp = await axios.get(url, {
-    headers: { "X-Shopify-Access-Token": token }
-  });
+  const url = `https://${store}/admin/api/2025-01/products.json?limit=250&fields=id,title,handle,tags,images,variants,status,published_at`;
+  const resp = await axios.get(url, { headers: { "X-Shopify-Access-Token": token } });
 
   const products = (resp.data.products || [])
     .filter((p) => p.status === "active" && p.published_at)
@@ -71,107 +96,91 @@ async function fetchProductsByTags(tags) {
       return tags.every((t) => ptags.includes(t));
     })
     .slice(0, 12)
-.map((p) => {
-  const publicDomain = process.env.PUBLIC_STORE_DOMAIN || process.env.SHOPIFY_STORE;
-  return {
-    id: p.id,
-    title: p.title,
-    handle: p.handle,
-    url: `https://${publicDomain}/products/${p.handle}`,
-    tags: p.tags,
-    image: p.images?.[0]?.src || null,
-    variant_id: p.variants?.[0]?.id || null,
-    price: p.variants?.[0]?.price || null
-  };
-});
-
+    .map((p) => ({
+      id: p.id,
+      title: p.title,
+      handle: p.handle,
+      tags: p.tags,
+      image: p.images?.[0]?.src || null,
+      variant_id: p.variants?.[0]?.id || null,
+      price: p.variants?.[0]?.price || null,
+      url: p.handle ? `/products/${p.handle}` : null
+    }));
 
   return products;
 }
 
-let blogCache = { blogs: null, fetchedAt: 0 };
+// ---- Prompts
+const CHAT_MODE_SYSTEM = `
+You are Soulpawy's friendly, empathetic AI pet assistant.
+Goal: Understand the pet’s situation through natural conversation (not a form).
+You must guide the user back on track if they drift away from the pet topic.
 
-async function getBlogs() {
-  const store = process.env.SHOPIFY_STORE;
-  const token = await getShopifyAccessToken();
+Rules:
+- DO NOT output JSON.
+- DO NOT recommend products yet.
+- DO NOT mention discounts yet.
+- Ask 1–2 focused follow-up questions at a time.
+- Use the pet’s name if provided.
+- If user message is vague, ask clarifying questions.
+- If user mentions severe symptoms (breathing trouble, collapse, seizures, heavy bleeding, inability to urinate, suspected poisoning), tell them to contact an emergency vet immediately, then ask a minimal safety question.
 
-  const now = Date.now();
-  if (blogCache.blogs && now - blogCache.fetchedAt < 10 * 60 * 1000) {
-    return blogCache.blogs;
-  }
+Tone:
+- Warm, friend-like, supportive, concise.
+`;
 
-  const url = `https://${store}/admin/api/2024-10/blogs.json?limit=50&fields=id,title,handle`;
-  const resp = await axios.get(url, {
-    headers: { "X-Shopify-Access-Token": token }
-  });
+const FINALIZE_SYSTEM = `
+You are Soulpawy's AI pet assistant. Now it's time to finalize.
+Return ONLY valid JSON with this schema (no markdown, no extra text):
 
-  blogCache.blogs = resp.data.blogs || [];
-  blogCache.fetchedAt = now;
-  return blogCache.blogs;
+{
+  "pet_type": "dog" | "cat" | "unknown",
+  "pet_name": string,
+  "problem_title": string,
+  "urgency": "low" | "medium" | "high",
+  "risk_flag": "none" | "urgent_vet" | "behavior_pro",
+  "short_summary": string,
+
+  "daily_actions": [
+    {"title": string, "steps": [string, string, string], "why": string}
+  ],
+  "weekly_plan": [
+    {"day_range": "days 1-2" | "days 3-4" | "days 5-7", "focus": string, "steps": [string, string]}
+  ],
+
+  "product_tags": [string],
+  "product_usage": [
+    {"tag": string, "how_to": [string, string], "why_it_helps": string}
+  ],
+
+  "discount_tier": 10 | 15 | 20 | 25,
+  "discount_message": string,
+
+  "articles_available": true
 }
 
-async function fetchBlogRecommendations(blogTags) {
-  const store = process.env.SHOPIFY_STORE;
-  if (!store) throw new Error("SHOPIFY_STORE is not set");
+Constraints:
+- product_tags must include species_dog or species_cat.
+- product_tags must be 2-6 items.
+- product_usage must reference tags that exist in product_tags (where applicable).
+- discount_tier must be 10/15/20/25.
+- discount_message must present the discount as a personal initiative based on the situation (do NOT say random).
+- Do not mention external competitor products or brands.
 
-  const publicDomain = process.env.PUBLIC_STORE_DOMAIN || store;
+Allowed NEED tags (use these only when needed):
+need_anxiety, need_separation, need_chewing, need_scratching, need_sleep, need_enrichment, need_boredom, need_high_energy, need_noise, need_feeding
 
-  const token = await getShopifyAccessToken();
-  const blogs = await getBlogs();
+Allowed TYPE tags (use these only when needed):
+type_heartbeat, type_chew, type_puzzle, type_calming_wrap, type_scratch_post, type_feeder, type_noise_mask
 
-  // Prefer "learn" blog handle if exists; otherwise first blog
-  const learnBlog =
-    blogs.find((b) => (b.handle || "").toLowerCase() === "learn") || blogs[0];
+Species tags (must include one):
+species_dog, species_cat
+`;
 
-  if (!learnBlog) return [];
+// ---- Health
+app.get("/health", (req, res) => res.send("OK"));
 
-  const url = `https://${store}/admin/api/2024-10/blogs/${learnBlog.id}/articles.json?limit=50&fields=id,title,handle,tags,published_at`;
-  const resp = await axios.get(url, {
-    headers: { "X-Shopify-Access-Token": token }
-  });
-
-  const wanted = (blogTags || []).filter((t) => t && t !== "core_topic");
-  if (wanted.length === 0) return [];
-
-  const articles = (resp.data.articles || [])
-    .filter((a) => a.published_at)
-    .filter((a) => {
-      const atags = (a.tags || "").split(",").map((x) => x.trim());
-      return wanted.some((t) => atags.includes(t));
-    })
-    .sort((a, b) => new Date(b.published_at) - new Date(a.published_at))
-    .slice(0, 3)
-    .map((a) => ({
-      title: a.title,
-      url: `https://${publicDomain}/blogs/${learnBlog.handle}/${a.handle}`
-    }));
-
-  return articles;
-}
-
-
-const app = express();
-app.use(cors());
-app.use(express.json());
-
-// Simple request log
-app.use((req, res, next) => {
-  console.log(`[REQ] ${req.method} ${req.path}`);
-  next();
-});
-
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY
-});
-
-app.get("/health", (req, res) => {
-  res.send("OK");
-});
-
-/**
- * GET /products-by-tags?tags=need_anxiety,species_dog,type_heartbeat
- * Returns up to 12 active, published products that contain ALL tags.
- */
+// ---- Debug endpoint kept (optional)
 app.get("/products-by-tags", async (req, res) => {
   try {
     const tags = (req.query.tags || "")
@@ -185,119 +194,125 @@ app.get("/products-by-tags", async (req, res) => {
     res.json({ products });
   } catch (err) {
     console.error("SHOPIFY ERROR:", err?.response?.status, err?.message, err?.response?.data);
-    res.status(500).json({
-      error: "Shopify error",
-      detail: err?.response?.data || err?.message || String(err)
-    });
+    res.status(500).json({ error: "Shopify error", detail: err?.message || String(err) });
   }
 });
 
-function systemPrompt() {
-  return `
-You are Soulpawy's pet behavior triage assistant.
-Return ONLY valid JSON matching this schema:
-
-{
-  "risk_flag": "none" | "urgent_vet" | "behavior_pro",
-  "pet_type": "dog" | "cat" | "unknown",
-  "needs": ["need_anxiety","need_separation","need_chewing","need_scratching","need_sleep","need_enrichment","need_boredom","need_high_energy","need_noise","need_feeding"],
-  "daily_actions": [{"title":"","steps":["",""],"why":""}],
-  "weekly_plan": [{"day_range":"days 1-2|days 3-4|days 5-7","focus":"","steps":["",""]}],
-  "blog_tags": ["need_anxiety","need_separation","need_sleep","core_topic"],
-  "product_tags": ["need_anxiety","need_separation","type_heartbeat","species_dog"],
-  "short_summary": ""
-}
-
-Rules:
-- Use ONLY tags from the allowed lists above.
-- needs must be 1-5 items.
-- daily_actions must be 3 items, weekly_plan must be 3 items.
-- product_tags must include species_dog or species_cat.
-- No extra text, no markdown, JSON only.
-`;
-}
-
-/**
- * POST /analyze
- * Body: { "message": "..." }
- * Returns: { result: "<JSON string>" }
- */
-app.post("/analyze", async (req, res) => {
-  try {
-    const { message } = req.body;
-    if (!message || typeof message !== "string") {
-      return res.status(400).json({ error: "Bad request", detail: "message is required" });
-    }
-
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
-      messages: [
-        { role: "system", content: systemPrompt() },
-        { role: "user", content: message }
-      ]
-    });
-
-    res.json({ result: completion.choices[0].message.content });
-  } catch (err) {
-    console.error("AI ERROR:", err?.status, err?.message, err?.response?.data);
-    res.status(500).json({
-      error: "AI error",
-      detail: err?.message || String(err)
-    });
-  }
-});
-
-/**
- * POST /chat
- * Body: { "message": "..." }
- * Returns: { analysis, products, blogs }
- */
+// ---- Main: Chat endpoint (two-mode)
+// Request body example:
+// {
+//   "mode": "chat" | "finalize",
+//   "messages": [{ "role":"user"|"assistant", "content":"..." }, ...],
+//   "pet": { "pet_type":"dog"|"cat"|null, "pet_name":"Jasmy"|null } // optional
+// }
 app.post("/chat", async (req, res) => {
   try {
-    const { message } = req.body;
-    if (!message || typeof message !== "string") {
-      return res.status(400).json({ error: "Bad request", detail: "message is required" });
+    const mode = (req.body?.mode || "chat").toLowerCase();
+    const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
+    const petTypeHint = req.body?.pet?.pet_type || "";
+    const petNameHint = req.body?.pet?.pet_name || "";
+
+    if (messages.length === 0) {
+      return res.status(400).json({ error: "Bad request", detail: "messages[] is required" });
     }
 
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
-      messages: [
-        { role: "system", content: systemPrompt() },
-        { role: "user", content: message }
-      ]
-    });
+    if (mode === "chat") {
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4.1-mini",
+        messages: [
+          { role: "system", content: CHAT_MODE_SYSTEM.trim() },
+          // Optional hint (so it uses name if we already know)
+          petNameHint || petTypeHint
+            ? {
+                role: "system",
+                content: `Known context: pet_type_hint=${petTypeHint || "unknown"}, pet_name_hint=${petNameHint || "unknown"}. Use pet_name if available.`
+              }
+            : null,
+          ...messages
+        ].filter(Boolean)
+      });
 
-    const raw = completion.choices[0].message.content || "";
-    let analysis;
-    try {
-      analysis = JSON.parse(raw);
-    } catch {
-      return res.status(500).json({ error: "Bad AI JSON", raw });
+      const assistant_message = completion.choices?.[0]?.message?.content?.trim() || "";
+      return res.json({ mode: "chat", assistant_message });
     }
 
-    // Products: strict first, then relax type_* tags
-    const tags = Array.isArray(analysis.product_tags) ? analysis.product_tags : [];
-    let products = [];
-    if (tags.length > 0) {
-      products = await fetchProductsByTags(tags);
-      if (products.length === 0) {
-        const relaxed = tags.filter((t) => !String(t).startsWith("type_"));
-        if (relaxed.length > 0) products = await fetchProductsByTags(relaxed);
+    if (mode === "finalize") {
+      const completion = await openai.chat.completions.create({
+        model: "gpt-4.1-mini",
+        messages: [
+          { role: "system", content: FINALIZE_SYSTEM.trim() },
+          petNameHint || petTypeHint
+            ? {
+                role: "system",
+                content: `Known context: pet_type_hint=${petTypeHint || "unknown"}, pet_name_hint=${petNameHint || "unknown"}.`
+              }
+            : null,
+          ...messages
+        ].filter(Boolean)
+      });
+
+      const raw = completion.choices?.[0]?.message?.content?.trim() || "";
+      const parsed = safeJsonParse(raw);
+
+      if (!parsed) {
+        return res.status(500).json({
+          error: "AI error",
+          detail: "Finalize returned invalid JSON",
+          raw
+        });
       }
+
+      // Enforce discount code mapping
+      const tier = normalizeDiscountTier(parsed.discount_tier);
+      const discount_code = DISCOUNT_CODES[tier];
+
+      // Enforce product tags sanity
+      const product_tags = Array.isArray(parsed.product_tags) ? parsed.product_tags : [];
+      const hasDog = product_tags.includes("species_dog");
+      const hasCat = product_tags.includes("species_cat");
+      if (!hasDog && !hasCat) {
+        // fallback using pet_type
+        const t = (parsed.pet_type || "").toLowerCase();
+        if (t === "cat") product_tags.push("species_cat");
+        else product_tags.push("species_dog");
+      }
+
+      // Fetch products ONLY now (finalize)
+      const products = await fetchProductsByTags(product_tags);
+
+      return res.json({
+        mode: "finalize",
+        assistant_message: parsed.discount_message || parsed.short_summary || "",
+        analysis: {
+          pet_type: parsed.pet_type,
+          pet_name: parsed.pet_name,
+          problem_title: parsed.problem_title,
+          urgency: parsed.urgency,
+          risk_flag: parsed.risk_flag,
+          short_summary: parsed.short_summary,
+          daily_actions: parsed.daily_actions,
+          weekly_plan: parsed.weekly_plan,
+          product_tags,
+          product_usage: parsed.product_usage,
+          articles_available: !!parsed.articles_available
+        },
+        discount: {
+          percent: tier,
+          code: discount_code,
+          message: parsed.discount_message
+        },
+        products,
+        // blogs intentionally NOT auto-served here; frontend later can ask and call /blogs endpoint in future step
+        blogs: []
+      });
     }
 
-    // Blogs
-    const blogTags = Array.isArray(analysis.blog_tags) ? analysis.blog_tags : [];
-    const blogs = await fetchBlogRecommendations(blogTags);
-
-    res.json({ analysis, products: products.slice(0, 6), blogs });
+    return res.status(400).json({ error: "Bad request", detail: "mode must be chat or finalize" });
   } catch (err) {
-    console.error("CHAT ERROR:", err?.response?.status, err?.message, err?.response?.data);
-    res.status(500).json({ error: "Chat error", detail: err?.message || String(err) });
+    console.error("CHAT ERROR:", err?.status, err?.message, err?.response?.data);
+    res.status(500).json({ error: "AI error", detail: err?.message || String(err) });
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("Server running on " + PORT);
-});
+app.listen(PORT, () => console.log("Server running on " + PORT));
