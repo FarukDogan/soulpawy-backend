@@ -101,13 +101,9 @@ async function fetchProductsByTags(requestedTags) {
         .map((x) => x.trim())
         .filter(Boolean);
 
-      // 1) tagless products never eligible
       if (ptags.length === 0) return null;
-
-      // 2) species must match (if requested)
       if (speciesTag && !ptags.includes(speciesTag)) return null;
 
-      // 3) score + require at least 1 match beyond species
       let score = 0;
       let matchedNonSpecies = 0;
 
@@ -126,7 +122,6 @@ async function fetchProductsByTags(requestedTags) {
         }
       }
 
-      // if we have a species constraint, enforce at least 1 non-species match
       if (speciesTag && matchedNonSpecies === 0) return null;
 
       return {
@@ -149,30 +144,36 @@ async function fetchProductsByTags(requestedTags) {
     .map(({ _score, ...rest }) => rest);
 }
 
-// --- BLOG/ARTICLE FETCH + MATCHING (NEW) ---
-let blogMapCache = { map: null, expiresAt: 0 };
+// --- BLOG/ARTICLE FETCH + MATCHING (ROBUST) ---
+// We avoid relying on /articles.json directly.
+// We fetch blogs, then fetch /blogs/{id}/articles.json for each blog.
+// Cached to keep Shopify calls low.
+let blogCache = { blogs: null, expiresAt: 0 };
 let articleCache = { items: null, expiresAt: 0 };
 
-async function getBlogIdToHandleMap() {
+async function getBlogsCached() {
   const now = Date.now();
-  if (blogMapCache.map && now < blogMapCache.expiresAt) return blogMapCache.map;
+  if (blogCache.blogs && now < blogCache.expiresAt) return blogCache.blogs;
 
   const store = process.env.SHOPIFY_STORE;
   if (!store) throw new Error("Missing SHOPIFY_STORE env var");
 
   const token = await getShopifyAccessToken();
-
   const url = `https://${store}/admin/api/2025-01/blogs.json?limit=250&fields=id,handle`;
   const resp = await axios.get(url, { headers: { "X-Shopify-Access-Token": token } });
 
-  const map = {};
-  for (const b of (resp.data.blogs || [])) {
-    map[b.id] = b.handle;
-  }
+  const blogs = (resp.data.blogs || []).map(b => ({ id: b.id, handle: b.handle }));
+  blogCache.blogs = blogs;
+  blogCache.expiresAt = now + 15 * 60 * 1000; // 15 min
+  return blogs;
+}
 
-  blogMapCache.map = map;
-  blogMapCache.expiresAt = now + 15 * 60 * 1000; // 15 min
-  return map;
+function stripHtmlToExcerpt(html, maxLen = 180) {
+  return String(html || "")
+    .replace(/<[^>]+>/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLen);
 }
 
 async function getAllArticlesCached() {
@@ -183,66 +184,63 @@ async function getAllArticlesCached() {
   if (!store) throw new Error("Missing SHOPIFY_STORE env var");
 
   const token = await getShopifyAccessToken();
-  const blogMap = await getBlogIdToHandleMap();
+  const blogs = await getBlogsCached();
 
-  // NOTE: limit=250. If you have >250 articles, we can add pagination later.
-  const url = `https://${store}/admin/api/2025-01/articles.json?limit=250&fields=id,title,handle,blog_id,tags,summary_html,image,published_at`;
-  const resp = await axios.get(url, { headers: { "X-Shopify-Access-Token": token } });
+  const all = [];
+  for (const b of blogs) {
+    // NOTE: limit=250 per blog. If any blog has >250, we can add pagination later.
+    const url = `https://${store}/admin/api/2025-01/blogs/${b.id}/articles.json?limit=250&fields=id,title,handle,tags,summary_html,image,published_at`;
+    const resp = await axios.get(url, { headers: { "X-Shopify-Access-Token": token } });
 
-  const items = (resp.data.articles || [])
-    .filter((a) => !!a.published_at)
-    .map((a) => {
-      const blogHandle = blogMap[a.blog_id] || null;
-      const urlPath = (blogHandle && a.handle) ? `/blogs/${blogHandle}/${a.handle}` : null;
+    const items = (resp.data.articles || [])
+      .filter(a => !!a.published_at)
+      .map(a => {
+        const tags = (a.tags || "")
+          .split(",")
+          .map(x => x.trim())
+          .filter(Boolean);
 
-      const tags = (a.tags || "")
-        .split(",")
-        .map((x) => x.trim())
-        .filter(Boolean);
+        return {
+          id: a.id,
+          title: a.title,
+          handle: a.handle,
+          url: (b.handle && a.handle) ? `/blogs/${b.handle}/${a.handle}` : null,
+          tags,
+          excerpt: stripHtmlToExcerpt(a.summary_html, 180),
+          image: a.image?.src || null,
+          published_at: a.published_at
+        };
+      });
 
-      const excerpt = (a.summary_html || "")
-        .replace(/<[^>]+>/g, "")
-        .replace(/\s+/g, " ")
-        .trim()
-        .slice(0, 180);
+    all.push(...items);
+  }
 
-      return {
-        id: a.id,
-        title: a.title,
-        handle: a.handle,
-        blog_id: a.blog_id,
-        url: urlPath,
-        tags,
-        excerpt,
-        image: a.image?.src || null,
-        published_at: a.published_at
-      };
-    });
-
-  articleCache.items = items;
+  articleCache.items = all;
   articleCache.expiresAt = now + 15 * 60 * 1000; // 15 min
-  return items;
+  return all;
 }
 
 async function fetchArticlesByTags(product_tags) {
   const tags = Array.isArray(product_tags) ? product_tags : [];
-  const speciesTag = tags.find((t) => t === "species_dog" || t === "species_cat") || null;
-  const typeTags = tags.filter((t) => t.startsWith("type_"));
-  const needTags = tags.filter((t) => t.startsWith("need_"));
+  const speciesTag = tags.find(t => t === "species_dog" || t === "species_cat") || null;
+  const typeTags = tags.filter(t => t.startsWith("type_"));
+  const needTags = tags.filter(t => t.startsWith("need_"));
 
   const articles = await getAllArticlesCached();
 
   const scored = articles
-    .map((a) => {
+    .map(a => {
       let score = 0;
 
+      // Optional (only if your articles also have species tags)
       if (speciesTag && a.tags.includes(speciesTag)) score += 1;
+
       for (const t of typeTags) if (a.tags.includes(t)) score += 4;
       for (const n of needTags) if (a.tags.includes(n)) score += 2;
 
       return { ...a, _score: score };
     })
-    .filter((a) => a._score > 0);
+    .filter(a => a._score > 0);
 
   return scored
     .sort((x, y) => y._score - x._score)
@@ -306,10 +304,7 @@ Return ONLY valid JSON with this schema (no markdown, no extra text):
       "steps": [string, string, string],
       "why": string,
       "product_hooks": [
-        {
-          "tag": string,
-          "instruction": string
-        }
+        { "tag": string, "instruction": string }
       ]
     }
   ],
@@ -320,10 +315,7 @@ Return ONLY valid JSON with this schema (no markdown, no extra text):
       "focus": string,
       "steps": [string, string],
       "product_hooks": [
-        {
-          "tag": string,
-          "instruction": string
-        }
+        { "tag": string, "instruction": string }
       ]
     }
   ],
@@ -406,11 +398,8 @@ app.post("/chat", async (req, res) => {
       }
 
       const products = await fetchProductsByTags(product_tags);
-
-      // NEW: articles matched by the same tag set (optional display in frontend)
       const articles = await fetchArticlesByTags(product_tags);
 
-      // pass-through analysis including product hooks
       const analysis = {
         pet_type: parsed.pet_type,
         pet_name: parsed.pet_name,
@@ -429,10 +418,7 @@ app.post("/chat", async (req, res) => {
         mode: "finalize",
         assistant_message: parsed.final_message || parsed.short_summary || "",
         analysis,
-        discount: {
-          percent: tier,
-          code: discount_code
-        },
+        discount: { percent: tier, code: discount_code },
         products,
         articles
       });
