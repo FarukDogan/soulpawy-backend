@@ -36,7 +36,6 @@ async function getShopifyAccessToken() {
   }
 
   const now = Date.now();
-  // refresh 5 minutes early
   if (shopifyTokenCache.token && now < shopifyTokenCache.expiresAt - 5 * 60 * 1000) {
     return shopifyTokenCache.token;
   }
@@ -72,10 +71,11 @@ function safeJsonParse(str) {
 
 /**
  * Product matching: "mostly matches" (scored), not 100% tag match
- * Rules:
- *  - species tag (species_dog/species_cat) is required (if present)
- *  - type_ tags weighted more than need_ tags
- *  - rank by score, return top N
+ * Key rules for QUALITY:
+ * - Tagless products are excluded.
+ * - Species must match (if provided).
+ * - Must match at least 1 non-species tag (type_/need_) to be eligible.
+ * - type_ tags weighted higher than need_ tags.
  */
 async function fetchProductsByTags(requestedTags) {
   const store = process.env.SHOPIFY_STORE;
@@ -87,7 +87,6 @@ async function fetchProductsByTags(requestedTags) {
   const resp = await axios.get(url, { headers: { "X-Shopify-Access-Token": token } });
 
   const tags = Array.isArray(requestedTags) ? requestedTags : [];
-
   const speciesTag = tags.find((t) => t === "species_dog" || t === "species_cat") || null;
   const typeTags = tags.filter((t) => t.startsWith("type_"));
   const needTags = tags.filter((t) => t.startsWith("need_"));
@@ -100,19 +99,33 @@ async function fetchProductsByTags(requestedTags) {
         .map((x) => x.trim())
         .filter(Boolean);
 
-      // Species required if we have it
+      // 1) tagless products never eligible
+      if (ptags.length === 0) return null;
+
+      // 2) species must match (if requested)
       if (speciesTag && !ptags.includes(speciesTag)) return null;
 
+      // 3) score + require at least 1 match beyond species
       let score = 0;
-      // baseline if species matches (or not provided)
+      let matchedNonSpecies = 0;
+
       if (speciesTag) score += 3;
 
       for (const t of typeTags) {
-        if (ptags.includes(t)) score += 4;
+        if (ptags.includes(t)) {
+          score += 4;
+          matchedNonSpecies++;
+        }
       }
       for (const n of needTags) {
-        if (ptags.includes(n)) score += 2;
+        if (ptags.includes(n)) {
+          score += 2;
+          matchedNonSpecies++;
+        }
       }
+
+      // if we have a species constraint, enforce at least 1 non-species match
+      if (speciesTag && matchedNonSpecies === 0) return null;
 
       return {
         id: p.id,
@@ -128,22 +141,13 @@ async function fetchProductsByTags(requestedTags) {
     })
     .filter(Boolean);
 
-  // Minimum threshold so we don't show totally unrelated items.
-  // If speciesTag exists, require at least 1 need/type match:
-  // - species baseline 3 + at least one need (2) => 5
-  // - or species baseline 3 + one type (4) => 7
-  const minScore = speciesTag ? 5 : 2;
-
-  const ranked = products
-    .filter((p) => p._score >= minScore)
+  return products
     .sort((a, b) => b._score - a._score)
     .slice(0, 12)
     .map(({ _score, ...rest }) => rest);
-
-  return ranked;
 }
 
-// Discount tiers (you will create these codes in Shopify Discounts)
+// Discount tiers (create these in Shopify Discounts)
 const DISCOUNT_CODES = {
   10: "SOULPAWY10",
   15: "SOULPAWY15",
@@ -191,16 +195,34 @@ Return ONLY valid JSON with this schema (no markdown, no extra text):
   "risk_flag": "none" | "urgent_vet" | "behavior_pro",
   "short_summary": string,
 
+  "product_tags": [string],
+
   "daily_actions": [
-    {"title": string, "steps": [string, string, string], "why": string}
-  ],
-  "weekly_plan": [
-    {"day_range": "days 1-2" | "days 3-4" | "days 5-7", "focus": string, "steps": [string, string]}
+    {
+      "title": string,
+      "steps": [string, string, string],
+      "why": string,
+      "product_hooks": [
+        {
+          "tag": string,
+          "instruction": string
+        }
+      ]
+    }
   ],
 
-  "product_tags": [string],
-  "product_usage": [
-    {"tag": string, "how_to": [string, string], "why_it_helps": string}
+  "weekly_plan": [
+    {
+      "day_range": "days 1-2" | "days 3-4" | "days 5-7",
+      "focus": string,
+      "steps": [string, string],
+      "product_hooks": [
+        {
+          "tag": string,
+          "instruction": string
+        }
+      ]
+    }
   ],
 
   "discount_tier": 10 | 15 | 20 | 25,
@@ -211,16 +233,21 @@ Return ONLY valid JSON with this schema (no markdown, no extra text):
 }
 
 Hard requirements:
-- final_message MUST include:
-  1) the problem in plain words (mention pet_name),
-  2) a confident but friendly transition into the plan,
-  3) a natural sales push: suggest adding the recommended items to cart today,
-  4) discount offered as personal initiative (no "random"),
-  5) mention: after purchase, we will email a copy of the plan + a summary of this chat as a thank-you.
-- DO NOT mention external competitor products/brands.
 - product_tags must include species_dog or species_cat.
-- product_tags must be 2-6 items.
+- product_tags must be 2-6 items and only from allowed lists below.
 - discount_tier must be 10/15/20/25.
+
+Most important:
+- daily_actions and weekly_plan MUST include product_hooks that reference tags in product_tags.
+- product_hooks must be practical usage instructions (when/how to use the product in the plan).
+- Do not “force” product hooks into every step; but overall the plan must clearly integrate products.
+
+final_message MUST include:
+1) the problem in plain words (mention pet_name),
+2) a confident but friendly transition into the plan,
+3) a natural sales push: suggest adding the recommended items to cart today,
+4) discount offered as personal initiative (no "random"),
+5) mention: after purchase, we will email a copy of the plan + a summary of this chat as a thank-you.
 
 Allowed NEED tags:
 need_anxiety, need_separation, need_chewing, need_scratching, need_sleep, need_enrichment, need_boredom, need_high_energy, need_noise, need_feeding
@@ -277,23 +304,25 @@ app.post("/chat", async (req, res) => {
 
       const products = await fetchProductsByTags(product_tags);
 
+      // pass-through analysis including product hooks
+      const analysis = {
+        pet_type: parsed.pet_type,
+        pet_name: parsed.pet_name,
+        problem_title: parsed.problem_title,
+        urgency: parsed.urgency,
+        risk_flag: parsed.risk_flag,
+        short_summary: parsed.short_summary,
+        product_tags,
+        daily_actions: parsed.daily_actions,
+        weekly_plan: parsed.weekly_plan,
+        ask_articles_question: parsed.ask_articles_question,
+        articles_available: !!parsed.articles_available
+      };
+
       return res.json({
         mode: "finalize",
         assistant_message: parsed.final_message || parsed.short_summary || "",
-        analysis: {
-          pet_type: parsed.pet_type,
-          pet_name: parsed.pet_name,
-          problem_title: parsed.problem_title,
-          urgency: parsed.urgency,
-          risk_flag: parsed.risk_flag,
-          short_summary: parsed.short_summary,
-          daily_actions: parsed.daily_actions,
-          weekly_plan: parsed.weekly_plan,
-          product_tags,
-          product_usage: parsed.product_usage,
-          ask_articles_question: parsed.ask_articles_question,
-          articles_available: !!parsed.articles_available
-        },
+        analysis,
         discount: {
           percent: tier,
           code: discount_code
