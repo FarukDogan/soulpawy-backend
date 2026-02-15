@@ -1,3 +1,5 @@
+// index.js (Render backend) — FULL FILE (CTRL+A -> DELETE -> PASTE)
+
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -144,6 +146,107 @@ async function fetchProductsByTags(requestedTags) {
   return products
     .sort((a, b) => b._score - a._score)
     .slice(0, 12)
+    .map(({ _score, ...rest }) => rest);
+}
+
+// --- BLOG/ARTICLE FETCH + MATCHING (NEW) ---
+let blogMapCache = { map: null, expiresAt: 0 };
+let articleCache = { items: null, expiresAt: 0 };
+
+async function getBlogIdToHandleMap() {
+  const now = Date.now();
+  if (blogMapCache.map && now < blogMapCache.expiresAt) return blogMapCache.map;
+
+  const store = process.env.SHOPIFY_STORE;
+  if (!store) throw new Error("Missing SHOPIFY_STORE env var");
+
+  const token = await getShopifyAccessToken();
+
+  const url = `https://${store}/admin/api/2025-01/blogs.json?limit=250&fields=id,handle`;
+  const resp = await axios.get(url, { headers: { "X-Shopify-Access-Token": token } });
+
+  const map = {};
+  for (const b of (resp.data.blogs || [])) {
+    map[b.id] = b.handle;
+  }
+
+  blogMapCache.map = map;
+  blogMapCache.expiresAt = now + 15 * 60 * 1000; // 15 min
+  return map;
+}
+
+async function getAllArticlesCached() {
+  const now = Date.now();
+  if (articleCache.items && now < articleCache.expiresAt) return articleCache.items;
+
+  const store = process.env.SHOPIFY_STORE;
+  if (!store) throw new Error("Missing SHOPIFY_STORE env var");
+
+  const token = await getShopifyAccessToken();
+  const blogMap = await getBlogIdToHandleMap();
+
+  // NOTE: limit=250. If you have >250 articles, we can add pagination later.
+  const url = `https://${store}/admin/api/2025-01/articles.json?limit=250&fields=id,title,handle,blog_id,tags,summary_html,image,published_at`;
+  const resp = await axios.get(url, { headers: { "X-Shopify-Access-Token": token } });
+
+  const items = (resp.data.articles || [])
+    .filter((a) => !!a.published_at)
+    .map((a) => {
+      const blogHandle = blogMap[a.blog_id] || null;
+      const urlPath = (blogHandle && a.handle) ? `/blogs/${blogHandle}/${a.handle}` : null;
+
+      const tags = (a.tags || "")
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean);
+
+      const excerpt = (a.summary_html || "")
+        .replace(/<[^>]+>/g, "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, 180);
+
+      return {
+        id: a.id,
+        title: a.title,
+        handle: a.handle,
+        blog_id: a.blog_id,
+        url: urlPath,
+        tags,
+        excerpt,
+        image: a.image?.src || null,
+        published_at: a.published_at
+      };
+    });
+
+  articleCache.items = items;
+  articleCache.expiresAt = now + 15 * 60 * 1000; // 15 min
+  return items;
+}
+
+async function fetchArticlesByTags(product_tags) {
+  const tags = Array.isArray(product_tags) ? product_tags : [];
+  const speciesTag = tags.find((t) => t === "species_dog" || t === "species_cat") || null;
+  const typeTags = tags.filter((t) => t.startsWith("type_"));
+  const needTags = tags.filter((t) => t.startsWith("need_"));
+
+  const articles = await getAllArticlesCached();
+
+  const scored = articles
+    .map((a) => {
+      let score = 0;
+
+      if (speciesTag && a.tags.includes(speciesTag)) score += 1;
+      for (const t of typeTags) if (a.tags.includes(t)) score += 4;
+      for (const n of needTags) if (a.tags.includes(n)) score += 2;
+
+      return { ...a, _score: score };
+    })
+    .filter((a) => a._score > 0);
+
+  return scored
+    .sort((x, y) => y._score - x._score)
+    .slice(0, 6)
     .map(({ _score, ...rest }) => rest);
 }
 
@@ -304,6 +407,9 @@ app.post("/chat", async (req, res) => {
 
       const products = await fetchProductsByTags(product_tags);
 
+      // NEW: articles matched by the same tag set (optional display in frontend)
+      const articles = await fetchArticlesByTags(product_tags);
+
       // pass-through analysis including product hooks
       const analysis = {
         pet_type: parsed.pet_type,
@@ -328,7 +434,7 @@ app.post("/chat", async (req, res) => {
           code: discount_code
         },
         products,
-        blogs: []
+        articles
       });
     }
 
