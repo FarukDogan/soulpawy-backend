@@ -17,11 +17,17 @@ app.use((req, res, next) => {
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// ---- Shopify: client credentials token cache
+/**
+ * Shopify: client credentials token cache
+ * Requires:
+ *  - SHOPIFY_STORE (example: tuxi7x-y5.myshopify.com)
+ *  - SHOPIFY_CLIENT_ID
+ *  - SHOPIFY_CLIENT_SECRET
+ */
 let shopifyTokenCache = { token: null, expiresAt: 0 };
 
 async function getShopifyAccessToken() {
-  const store = process.env.SHOPIFY_STORE; // tuxi7x-y5.myshopify.com
+  const store = process.env.SHOPIFY_STORE;
   const clientId = process.env.SHOPIFY_CLIENT_ID;
   const clientSecret = process.env.SHOPIFY_CLIENT_SECRET;
 
@@ -30,12 +36,12 @@ async function getShopifyAccessToken() {
   }
 
   const now = Date.now();
+  // refresh 5 minutes early
   if (shopifyTokenCache.token && now < shopifyTokenCache.expiresAt - 5 * 60 * 1000) {
     return shopifyTokenCache.token;
   }
 
   const url = `https://${store}/admin/oauth/access_token`;
-
   const body = new URLSearchParams();
   body.set("grant_type", "client_credentials");
   body.set("client_id", clientId);
@@ -56,7 +62,22 @@ async function getShopifyAccessToken() {
   return token;
 }
 
-async function fetchProductsByTags(tags) {
+function safeJsonParse(str) {
+  try {
+    return JSON.parse(str);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Product matching: "mostly matches" (scored), not 100% tag match
+ * Rules:
+ *  - species tag (species_dog/species_cat) is required (if present)
+ *  - type_ tags weighted more than need_ tags
+ *  - rank by score, return top N
+ */
+async function fetchProductsByTags(requestedTags) {
   const store = process.env.SHOPIFY_STORE;
   if (!store) throw new Error("Missing SHOPIFY_STORE env var");
 
@@ -65,45 +86,78 @@ async function fetchProductsByTags(tags) {
   const url = `https://${store}/admin/api/2025-01/products.json?limit=250&fields=id,title,handle,tags,images,variants,status,published_at`;
   const resp = await axios.get(url, { headers: { "X-Shopify-Access-Token": token } });
 
+  const tags = Array.isArray(requestedTags) ? requestedTags : [];
+
+  const speciesTag = tags.find((t) => t === "species_dog" || t === "species_cat") || null;
+  const typeTags = tags.filter((t) => t.startsWith("type_"));
+  const needTags = tags.filter((t) => t.startsWith("need_"));
+
   const products = (resp.data.products || [])
     .filter((p) => p.status === "active" && p.published_at)
-    .filter((p) => {
-      const ptags = (p.tags || "").split(",").map((x) => x.trim());
-      return tags.every((t) => ptags.includes(t));
+    .map((p) => {
+      const ptags = (p.tags || "")
+        .split(",")
+        .map((x) => x.trim())
+        .filter(Boolean);
+
+      // Species required if we have it
+      if (speciesTag && !ptags.includes(speciesTag)) return null;
+
+      let score = 0;
+      // baseline if species matches (or not provided)
+      if (speciesTag) score += 3;
+
+      for (const t of typeTags) {
+        if (ptags.includes(t)) score += 4;
+      }
+      for (const n of needTags) {
+        if (ptags.includes(n)) score += 2;
+      }
+
+      return {
+        id: p.id,
+        title: p.title,
+        handle: p.handle,
+        tags: p.tags,
+        image: p.images?.[0]?.src || null,
+        variant_id: p.variants?.[0]?.id || null,
+        price: p.variants?.[0]?.price || null,
+        url: p.handle ? `/products/${p.handle}` : null,
+        _score: score
+      };
     })
+    .filter(Boolean);
+
+  // Minimum threshold so we don't show totally unrelated items.
+  // If speciesTag exists, require at least 1 need/type match:
+  // - species baseline 3 + at least one need (2) => 5
+  // - or species baseline 3 + one type (4) => 7
+  const minScore = speciesTag ? 5 : 2;
+
+  const ranked = products
+    .filter((p) => p._score >= minScore)
+    .sort((a, b) => b._score - a._score)
     .slice(0, 12)
-    .map((p) => ({
-      id: p.id,
-      title: p.title,
-      handle: p.handle,
-      tags: p.tags,
-      image: p.images?.[0]?.src || null,
-      variant_id: p.variants?.[0]?.id || null,
-      price: p.variants?.[0]?.price || null,
-      url: p.handle ? `/products/${p.handle}` : null
-    }));
+    .map(({ _score, ...rest }) => rest);
 
-  return products;
+  return ranked;
 }
 
-function safeJsonParse(str) {
-  try { return JSON.parse(str); } catch { return null; }
-}
-
-// ---- Discount tiers (pre-created in Shopify)
+// Discount tiers (you will create these codes in Shopify Discounts)
 const DISCOUNT_CODES = {
   10: "SOULPAWY10",
   15: "SOULPAWY15",
   20: "SOULPAWY20",
   25: "SOULPAWY25"
 };
+
 function normalizeDiscountTier(x) {
   const n = Number(x);
   if ([10, 15, 20, 25].includes(n)) return n;
   return 10;
 }
 
-// ---- Prompts
+// --- Prompts
 const CHAT_MODE_SYSTEM = `
 You are Soulpawy's friendly, empathetic AI pet assistant.
 Goal: Understand the pet’s situation through natural conversation (not a form).
@@ -116,12 +170,14 @@ Rules:
 - Ask 1–2 focused follow-up questions at a time.
 - Use the pet’s name if provided.
 - If user message is vague, ask clarifying questions.
-- If severe symptoms (breathing trouble, collapse, seizures, heavy bleeding, inability to urinate, suspected poisoning), tell them to contact an emergency vet immediately, then ask one minimal safety question.
-- When you have enough info to produce a full plan, end your message with EXACTLY: I’m ready to create your plan.
+- If severe symptoms (breathing trouble, collapse, seizures, heavy bleeding, inability to urinate, suspected poisoning),
+  tell them to contact an emergency vet immediately, then ask one minimal safety question.
+- When you have enough info to produce a full plan, end your message with EXACTLY:
+  I’m ready to create your plan.
 
 Tone:
 - Warm, friend-like, supportive, concise.
-`;
+`.trim();
 
 const FINALIZE_SYSTEM = `
 You are Soulpawy's AI pet assistant. Now it's time to finalize.
@@ -166,30 +222,31 @@ Hard requirements:
 - product_tags must be 2-6 items.
 - discount_tier must be 10/15/20/25.
 
-Allowed NEED tags (use only when needed):
+Allowed NEED tags:
 need_anxiety, need_separation, need_chewing, need_scratching, need_sleep, need_enrichment, need_boredom, need_high_energy, need_noise, need_feeding
 
-Allowed TYPE tags (use only when needed):
+Allowed TYPE tags:
 type_heartbeat, type_chew, type_puzzle, type_calming_wrap, type_scratch_post, type_feeder, type_noise_mask
 
 Species tags (must include one):
 species_dog, species_cat
-`;
+`.trim();
 
 app.get("/health", (req, res) => res.send("OK"));
 
 app.post("/chat", async (req, res) => {
   try {
-    const mode = (req.body?.mode || "chat").toLowerCase();
-    const messages = Array.isArray(req.body?.messages) ? req.body.messages : [];
-    if (messages.length === 0) {
+    const mode = String(req.body?.mode || "chat").toLowerCase();
+    const msgs = Array.isArray(req.body?.messages) ? req.body.messages : [];
+
+    if (msgs.length === 0) {
       return res.status(400).json({ error: "Bad request", detail: "messages[] is required" });
     }
 
     if (mode === "chat") {
       const completion = await openai.chat.completions.create({
         model: "gpt-4.1-mini",
-        messages: [{ role: "system", content: CHAT_MODE_SYSTEM.trim() }, ...messages]
+        messages: [{ role: "system", content: CHAT_MODE_SYSTEM }, ...msgs]
       });
 
       const assistant_message = completion.choices?.[0]?.message?.content?.trim() || "";
@@ -199,7 +256,7 @@ app.post("/chat", async (req, res) => {
     if (mode === "finalize") {
       const completion = await openai.chat.completions.create({
         model: "gpt-4.1-mini",
-        messages: [{ role: "system", content: FINALIZE_SYSTEM.trim() }, ...messages]
+        messages: [{ role: "system", content: FINALIZE_SYSTEM }, ...msgs]
       });
 
       const raw = completion.choices?.[0]?.message?.content?.trim() || "";
@@ -209,14 +266,12 @@ app.post("/chat", async (req, res) => {
         return res.status(500).json({ error: "AI error", detail: "Finalize returned invalid JSON", raw });
       }
 
-      // discount mapping
       const tier = normalizeDiscountTier(parsed.discount_tier);
       const discount_code = DISCOUNT_CODES[tier];
 
-      // tags sanity
       const product_tags = Array.isArray(parsed.product_tags) ? parsed.product_tags : [];
       if (!product_tags.includes("species_dog") && !product_tags.includes("species_cat")) {
-        const t = (parsed.pet_type || "").toLowerCase();
+        const t = String(parsed.pet_type || "").toLowerCase();
         product_tags.push(t === "cat" ? "species_cat" : "species_dog");
       }
 
